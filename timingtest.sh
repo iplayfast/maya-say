@@ -1,5 +1,6 @@
 #!/bin/bash
 
+USE_LMDEPLOY=True
 # Colors for output
 CYAN='\033[1;36m'
 GREEN='\033[1;32m'
@@ -49,15 +50,30 @@ run_timed_test() {
     echo -e "${PURPLE}Voice: ${voice_desc}${NC}"
     echo -e "${PURPLE}Text length: ${#text} chars${NC}"
 
-    # Run and time the command
+    # Output file for this test
+    local output_file="test_${test_num}.wav"
+
+    # Run and time the synthesis command (output to file, no playback)
     local start=$(date +%s.%N)
-    python say.py -d "$voice_desc" "$text" 2>&1 | grep -E "INFO:|Model server"
+    python say.py -d "$voice_desc" "$text" --stream -o "$output_file" 2>&1 | grep -E "INFO:|Model server"
     local end=$(date +%s.%N)
 
-    # Calculate duration
+    # Calculate duration (synthesis only, no playback)
     local duration=$(echo "$end - $start" | bc)
 
-    echo -e "${GREEN}⏱  Duration: ${duration}s${NC}\n"
+    echo -e "${GREEN}⏱  Synthesis time: ${duration}s${NC}"
+
+    # Now play the generated audio (not timed)
+    if command -v play &> /dev/null; then
+        echo -e "${PURPLE}Playing audio...${NC}"
+        play "$output_file" 2>/dev/null
+    elif command -v aplay &> /dev/null; then
+        echo -e "${PURPLE}Playing audio...${NC}"
+        aplay "$output_file" 2>/dev/null
+    else
+        echo -e "${YELLOW}(No audio player found - skipping playback)${NC}"
+    fi
+    echo ""
 
     # Store result
     RESULTS+=("Test $test_num ($description): ${duration}s")
@@ -136,4 +152,9 @@ echo -e "• Compare Test 1 vs Test 2: Server startup overhead"
 echo -e "• Compare Test 2 vs Test 3: Voice description caching (if any)"
 echo -e "• Compare Test 3 vs Test 8: Performance consistency"
 echo -e "• Compare Test 4 vs Test 5: Text length scaling"
+echo -e "\n${CYAN}Note:${NC} Timings measure synthesis only (excluding audio playback)"
+echo -e "\n${CYAN}Cleanup:${NC}"
+echo -e "Removing test audio files..."
+rm -f test_*.wav
+echo -e "${GREEN}✓ Cleanup complete${NC}"
 echo -e "\n"

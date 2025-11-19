@@ -11,7 +11,9 @@ from pathlib import Path
 import soundfile as sf
 import sounddevice as sd
 
-from src.tts_client import send_text, is_server_running, ensure_model_server
+from src.tts_client import send_text, send_text_streaming, is_server_running, ensure_model_server
+from src.presets import PresetManager
+import numpy as np
 from src.constants import (
     DEFAULT_DESCRIPTION,
     DEFAULT_TEMPERATURE,
@@ -89,10 +91,51 @@ Supported Emotion Tags:
     )
 
     parser.add_argument(
+        '--batch',
+        type=str,
+        default=None,
+        help='Batch mode: path to file with one text per line'
+    )
+
+    parser.add_argument(
+        '--batch-output-dir',
+        type=str,
+        default='batch_output',
+        help='Directory for batch output files (default: batch_output)'
+    )
+
+    parser.add_argument(
         '-d', '--description',
         type=str,
-        default=DEFAULT_DESCRIPTION,
+        default=None,  # Will use preset or DEFAULT_DESCRIPTION
         help=f'Voice description (default: "{DEFAULT_DESCRIPTION}")'
+    )
+
+    parser.add_argument(
+        '--preset',
+        type=str,
+        default=None,
+        help='Use a saved voice preset'
+    )
+
+    parser.add_argument(
+        '--save-preset',
+        type=str,
+        default=None,
+        help='Save current voice description as a preset'
+    )
+
+    parser.add_argument(
+        '--list-presets',
+        action='store_true',
+        help='List all available voice presets'
+    )
+
+    parser.add_argument(
+        '--delete-preset',
+        type=str,
+        default=None,
+        help='Delete a saved preset'
     )
 
     parser.add_argument(
@@ -138,9 +181,21 @@ Supported Emotion Tags:
     )
 
     parser.add_argument(
+        '--stream',
+        action='store_true',
+        help='Enable streaming mode (play audio as it generates)'
+    )
+
+    parser.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose logging'
+    )
+
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug mode (shows detailed chunk information)'
     )
 
     parser.add_argument(
@@ -158,9 +213,32 @@ Supported Emotion Tags:
     args = parser.parse_args()
 
     # Set logging level
-    if args.verbose:
+    if args.verbose or args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logging.getLogger('src').setLevel(logging.DEBUG)
+
+    # Initialize preset manager
+    preset_manager = PresetManager()
+
+    # Handle preset listing
+    if args.list_presets:
+        presets = preset_manager.list_presets()
+        print("Available voice presets:")
+        print()
+        for name, description in sorted(presets.items()):
+            print(f"  {name}:")
+            print(f"    {description}")
+            print()
+        return 0
+
+    # Handle preset deletion
+    if args.delete_preset:
+        if preset_manager.delete_preset(args.delete_preset):
+            print(f"✓ Deleted preset '{args.delete_preset}'")
+            return 0
+        else:
+            logger.error(f"Preset '{args.delete_preset}' not found")
+            return 1
 
     # Kill server
     if args.kill:
@@ -206,9 +284,31 @@ Supported Emotion Tags:
             print(f"  python -m src.model_server")
             return 1
 
-    # Require text for synthesis
-    if not args.text:
-        parser.error("the following arguments are required: text (unless using --server-check or --kill)")
+    # Require text or batch mode for synthesis
+    if not args.text and not args.batch:
+        parser.error("the following arguments are required: text or --batch (unless using --server-check or --kill)")
+
+    # Resolve voice description (preset or explicit)
+    if args.preset:
+        description = preset_manager.get_preset(args.preset)
+        if description is None:
+            logger.error(f"Preset '{args.preset}' not found")
+            logger.info("Use --list-presets to see available presets")
+            return 1
+        logger.info(f"Using preset '{args.preset}'")
+    elif args.description:
+        description = args.description
+    else:
+        description = DEFAULT_DESCRIPTION
+
+    # Handle save preset
+    if args.save_preset:
+        preset_manager.save_preset(args.save_preset, description)
+        print(f"✓ Saved preset '{args.save_preset}':")
+        print(f"  {description}")
+        # Continue with synthesis if text was provided, otherwise exit
+        if not args.text and not args.batch:
+            return 0
 
     # Ensure server is running (auto-start if needed)
     if not ensure_model_server():
@@ -217,34 +317,153 @@ Supported Emotion Tags:
         logger.error("  python -m src.model_server")
         return 1
 
-    # Synthesize
+    # Handle batch mode
+    if args.batch:
+        logger.info(f"Batch mode: processing file '{args.batch}'")
+
+        # Read batch file
+        try:
+            with open(args.batch, 'r') as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+        except FileNotFoundError:
+            logger.error(f"Batch file not found: {args.batch}")
+            return 1
+        except Exception as e:
+            logger.error(f"Error reading batch file: {e}")
+            return 1
+
+        if not lines:
+            logger.error("Batch file is empty")
+            return 1
+
+        logger.info(f"Processing {len(lines)} texts")
+
+        # Create output directory
+        output_dir = Path(args.batch_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
+
+        # Process each line
+        success_count = 0
+        for i, text in enumerate(lines, 1):
+            logger.info(f"\n[{i}/{len(lines)}] Processing: '{text[:50]}...'")
+
+            output_file = output_dir / f"batch_{i:03d}.wav"
+
+            audio = send_text(
+                text=text,
+                description=description,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                max_new_tokens=args.max_tokens,
+                seed=args.seed,
+                stream=False,  # Batch mode doesn't use streaming
+            )
+
+            if audio is not None:
+                save_audio(audio, str(output_file))
+                success_count += 1
+                logger.info(f"✓ Saved to {output_file}")
+            else:
+                logger.error(f"✗ Failed to synthesize item {i}")
+
+        logger.info(f"\nBatch complete: {success_count}/{len(lines)} successful")
+        return 0 if success_count == len(lines) else 1
+
+    # Single text synthesis
     logger.info(f"Synthesizing: '{args.text[:50]}...'")
-    logger.info(f"Voice description: '{args.description}'")
+    logger.info(f"Voice description: '{description}'")
     if args.seed is not None:
         logger.info(f"Using seed: {args.seed}")
-    if args.verbose:
+    if args.stream:
+        logger.info("Streaming mode: ENABLED")
+    if args.debug:
+        logger.info("Debug mode: ENABLED - showing chunk details")
+    if args.verbose or args.debug:
         logger.debug(f"Temperature: {args.temperature}, Top-p: {args.top_p}")
 
-    audio = send_text(
-        text=args.text,
-        description=args.description,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
-        max_new_tokens=args.max_tokens,
-        seed=args.seed,
-    )
+    if args.stream:
+        # Streaming mode - play chunks as they arrive
+        if args.output:
+            # For file output, still collect all chunks
+            logger.info("Streaming to file...")
+            audio_chunks = []
+            for chunk in send_text_streaming(
+                text=args.text,
+                description=description,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                max_new_tokens=args.max_tokens,
+                seed=args.seed,
+            ):
+                audio_chunks.append(chunk)
 
-    if audio is None:
-        logger.error("Synthesis failed")
-        return 1
+            if not audio_chunks:
+                logger.error("Synthesis failed - no chunks received")
+                return 1
 
-    # Output
-    if args.output:
-        save_audio(audio, args.output)
+            audio = np.concatenate(audio_chunks)
+            save_audio(audio, args.output)
+        else:
+            # Play chunks as they arrive
+            logger.info("Starting streaming playback...")
+            chunk_num = 0
+            stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32')
+            stream.start()
+
+            try:
+                for chunk in send_text_streaming(
+                    text=args.text,
+                    description=description,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    repetition_penalty=args.repetition_penalty,
+                    max_new_tokens=args.max_tokens,
+                    seed=args.seed,
+                ):
+                    chunk_num += 1
+                    if args.debug:
+                        logger.info(f"Playing chunk {chunk_num}: {len(chunk)} samples ({len(chunk)/SAMPLE_RATE:.2f}s)")
+                    stream.write(chunk)
+
+                # Wait for playback to finish
+                stream.stop()
+                stream.close()
+
+                if chunk_num == 0:
+                    logger.error("Synthesis failed - no chunks received")
+                    return 1
+
+            except Exception as e:
+                logger.error(f"Streaming playback error: {e}")
+                stream.stop()
+                stream.close()
+                return 1
     else:
-        logger.info("Playing audio...")
-        play_audio(audio)
+        # Non-streaming mode
+        audio = send_text(
+            text=args.text,
+            description=description,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            max_new_tokens=args.max_tokens,
+            seed=args.seed,
+            stream=False,
+        )
+
+        if audio is None:
+            logger.error("Synthesis failed")
+            return 1
+
+        # Output
+        if args.output:
+            save_audio(audio, args.output)
+        else:
+            logger.info("Playing audio...")
+            play_audio(audio)
 
     return 0
 

@@ -1,0 +1,5 @@
+Hello, this is the first test.
+Welcome to batch processing mode!
+This is the third sentence.
+<laugh> Batch processing makes everything easier.
+Finally, the last item in our test batch.

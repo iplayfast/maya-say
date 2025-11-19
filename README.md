@@ -83,9 +83,79 @@ python say.py "Hello world!" -o output.wav
 # Adjust generation parameters
 python say.py "Hello!" --temperature 0.6 --max-tokens 3000
 
+# Enable streaming mode (lower latency)
+python say.py "Long text here..." --stream
+
+# Use a seed for reproducible output
+python say.py "Hello!" --seed 42
+
+# Batch processing from a file
+python say.py --batch texts.txt -d "Friendly voice"
+
 # Verbose output
 python say.py "Hello!" -v
 ```
+
+### Batch Processing
+
+Process multiple texts efficiently:
+
+```bash
+# Create a text file with one text per line
+cat > batch.txt << EOF
+Hello, this is the first sentence.
+Welcome to batch processing!
+This is much more efficient than individual requests.
+EOF
+
+# Process all texts
+python say.py --batch batch.txt -d "Clear female voice"
+
+# Custom output directory
+python say.py --batch batch.txt --batch-output-dir my_outputs
+
+# Use same seed for all items (reproducible)
+python say.py --batch batch.txt --seed 42
+```
+
+**Features:**
+- Processes multiple texts sequentially
+- Outputs to `batch_output/batch_001.wav`, `batch_002.wav`, etc.
+- Uses same voice description for all items
+- Efficient for generating multiple audio files
+
+### Voice Presets
+
+Save and reuse your favorite voice descriptions:
+
+```bash
+# List available presets
+python say.py --list-presets
+
+# Use a preset
+python say.py "Hello!" --preset female_energetic
+
+# Save current description as a preset
+python say.py --save-preset my_voice -d "Custom voice description here"
+
+# Use your saved preset
+python say.py "Hello!" --preset my_voice
+
+# Delete a preset
+python say.py --delete-preset my_voice
+```
+
+**Built-in presets:**
+- `male_american` - Realistic male, 30s, American accent
+- `female_american` - Young female, clear, American accent
+- `male_british` - Middle-aged male, British accent, formal
+- `female_british` - Young female, British accent, professional
+- `male_deep` - Deep commanding voice
+- `female_energetic` - Excited, energetic female voice
+- `male_calm` - Calm, soothing male voice
+- `narrator` - Professional narrator voice
+
+Presets are stored in `~/.config/maya/presets.json`
 
 ### Manual Server Control
 
@@ -111,6 +181,26 @@ Test scripts are provided to verify functionality:
 ./test_quickstart.sh
 ```
 
+## Streaming Mode
+
+maya-say supports streaming audio generation for lower latency:
+
+```bash
+# Enable streaming for faster perceived response
+python say.py "Your text here" --stream
+```
+
+**How it works:**
+- **Non-streaming (default)**: Generate all tokens → Decode all audio → Send/play
+- **Streaming**: Generate all tokens → Decode in chunks → Send/play as ready
+
+**Benefits:**
+- Lower perceived latency (audio starts playing sooner)
+- More efficient memory usage
+- Better for long texts and interactive applications
+
+**Note:** Total synthesis time is the same, but streaming reduces time-to-first-audio.
+
 ## Voice Descriptions
 
 Maya1 uses natural language to describe voices. **Important:** Use detailed descriptions - short ones may be vocalized by the model.
@@ -124,6 +214,13 @@ Maya1 uses natural language to describe voices. **Important:** Use detailed desc
 **Avoid (too short):**
 - `"Young female voice"` ← May be spoken as text
 - `"Male voice"` ← Too minimal
+
+**For many more examples, see [VOICE_EXAMPLES.md](VOICE_EXAMPLES.md)**
+
+**Demo different voices:**
+```bash
+./demo_voices.sh  # Generates 8 different voice samples
+```
 
 ## Emotion Tags
 
@@ -200,29 +297,55 @@ For significantly faster inference (4-10x speedup), you can use **LMdeploy** ins
 
 ### Using LMdeploy
 
-LMdeploy provides optimized inference for large language models with minimal code changes:
+LMdeploy provides optimized inference for large language models:
 
 - **4x faster** than transformers without batching
 - **10x+ faster** with batching enabled
 - Lower memory usage
 - Better throughput for concurrent requests
+- KV-cache quantization for reduced VRAM usage
 
 **Installation:**
 ```bash
 pip install lmdeploy
 ```
 
-**Implementation Notes:**
-- LMdeploy replaces the transformers `model.generate()` call with optimized inference
-- Requires minor modifications to `src/model_server.py`
-- See [FastMaya implementation](https://github.com/ysharma3501/FastMaya) for reference
+**Enabling LMdeploy:**
+
+1. Install LMdeploy (see above)
+2. Edit `src/constants.py` and set:
+   ```python
+   USE_LMDEPLOY = True
+   ```
+3. Optional: Adjust configuration parameters:
+   ```python
+   LMDEPLOY_MEMORY_UTIL = 0.9  # GPU memory utilization (0.0-1.0)
+   LMDEPLOY_TP = 1              # Tensor parallelism (for multi-GPU)
+   LMDEPLOY_ENABLE_PREFIX_CACHING = True  # Cache common prompt prefixes
+   LMDEPLOY_QUANT_POLICY = 0    # KV-cache quantization: 0 (disabled), 4, 8
+   ```
+4. Restart the server:
+   ```bash
+   python say.py --kill
+   python say.py "Test with LMdeploy!"
+   ```
+
+**Configuration Options:**
+- `LMDEPLOY_MEMORY_UTIL`: Controls GPU VRAM usage (e.g., 0.9 = 90%)
+- `LMDEPLOY_TP`: Tensor parallelism for multi-GPU setups (default: 1)
+- `LMDEPLOY_ENABLE_PREFIX_CACHING`: Caches common prompt parts for faster repeated generations
+- `LMDEPLOY_QUANT_POLICY`: KV-cache quantization (0=disabled, 4=4-bit, 8=8-bit)
 
 **Trade-offs:**
 - Additional dependency (~2GB install)
-- Slightly different API from transformers
-- May require tuning for optimal results
+- Slightly different generation behavior (may need parameter tuning)
+- No `min_new_tokens` support (uses different stopping strategy)
 
-The current maya-say implementation prioritizes simplicity and compatibility. LMdeploy integration is left as an optional enhancement for users who need maximum performance.
+**Performance Notes:**
+Based on [FastMaya benchmarks](https://github.com/ysharma3501/FastMaya):
+- RTF (Real-Time Factor) of 0.02 on A100 (50x faster than realtime)
+- Can generate 50 seconds of audio in 1 second with batching
+- Roughly 2x faster than vLLM implementation
 
 ## Differences from kokoro-say
 
@@ -241,4 +364,4 @@ Apache 2.0 (following Maya1's license)
 Based on:
 - [Maya1](https://huggingface.co/maya-research/maya1) by Maya Research
 - [SNAC](https://github.com/hubertsiuzdak/snac) by Hubert Siuzdak
-- Architecture inspired by [kokoro-say](https://github.com/hexgrad/kokoro)
+- Architecture inspired by [kokoro-say](https://github.com/iplayfast/kokoro-say)

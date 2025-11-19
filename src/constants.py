@@ -59,3 +59,10 @@ SERVER_STARTUP_TIMEOUT = 60  # Seconds to wait for server to start (Maya1 is hea
 
 # Logging
 LOG_LEVEL = "INFO"
+
+# Backend configuration
+USE_LMDEPLOY = False  # Set to True to use LMdeploy for 4-10x speedup
+LMDEPLOY_MEMORY_UTIL = 0.9  # GPU memory utilization (0.0-1.0)
+LMDEPLOY_TP = 1  # Tensor parallelism (for multi-GPU)
+LMDEPLOY_ENABLE_PREFIX_CACHING = True  # Cache common prompt prefixes
+LMDEPLOY_QUANT_POLICY = 0  # KV-cache quantization: 0 (disabled), 4, 8

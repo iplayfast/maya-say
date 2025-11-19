@@ -32,6 +32,79 @@ from src.socket_protocol import SocketProtocol
 logger = logging.getLogger(__name__)
 
 
+def send_text_streaming(
+    text: str,
+    description: str = DEFAULT_DESCRIPTION,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: float = DEFAULT_TOP_P,
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    seed: Optional[int] = None,
+    timeout: float = SOCKET_TIMEOUT,
+):
+    """
+    Send text for synthesis and yield audio chunks as they arrive.
+
+    Yields:
+        Audio chunk as numpy array
+    """
+    try:
+        # Connect to server
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((MODEL_SERVER_HOST, MODEL_SERVER_PORT))
+
+        # Send request
+        request = {
+            'text': text,
+            'description': description,
+            'max_new_tokens': max_new_tokens,
+            'min_new_tokens': min_new_tokens,
+            'temperature': temperature,
+            'top_p': top_p,
+            'repetition_penalty': repetition_penalty,
+            'seed': seed,
+            'stream': True,  # Always use streaming
+        }
+        SocketProtocol.send_json(sock, request)
+
+        # Receive and yield chunks as they arrive
+        chunk_num = 0
+        for msg_type, data in SocketProtocol.receive_stream(sock):
+            if msg_type == 'audio':
+                chunk_num += 1
+
+                # Convert to audio array
+                audio_chunk = np.frombuffer(data, dtype=np.float32)
+
+                # Debug: Show chunk info
+                chunk_samples = len(audio_chunk)
+                chunk_duration = chunk_samples / 24000
+                logger.debug(f"Received chunk {chunk_num}: {chunk_samples} samples ({chunk_duration:.2f}s)")
+
+                yield audio_chunk
+            elif msg_type == 'error':
+                logger.error(f"Server error: {data}")
+                return
+            elif msg_type == 'end':
+                break
+
+        sock.close()
+        logger.info(f"Received {chunk_num} audio chunks total")
+
+    except socket.timeout:
+        logger.error("Request timed out")
+        return
+    except ConnectionRefusedError:
+        logger.error(f"Could not connect to server at {MODEL_SERVER_HOST}:{MODEL_SERVER_PORT}")
+        logger.error("Make sure the model server is running")
+        return
+    except Exception as e:
+        logger.error(f"Client error: {e}")
+        return
+
+
 def send_text(
     text: str,
     description: str = DEFAULT_DESCRIPTION,
@@ -41,6 +114,7 @@ def send_text(
     top_p: float = DEFAULT_TOP_P,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     seed: Optional[int] = None,
+    stream: bool = False,
     timeout: float = SOCKET_TIMEOUT,
 ) -> Optional[np.ndarray]:
     """
@@ -55,6 +129,7 @@ def send_text(
         top_p: Nucleus sampling parameter
         repetition_penalty: Penalty for repetition
         seed: Random seed for reproducible generation (optional)
+        stream: Enable streaming mode (receive audio chunks as generated)
         timeout: Socket timeout in seconds
 
     Returns:
@@ -76,14 +151,22 @@ def send_text(
             'top_p': top_p,
             'repetition_penalty': repetition_penalty,
             'seed': seed,
+            'stream': stream,
         }
         SocketProtocol.send_json(sock, request)
 
         # Receive response
         audio_chunks = []
+        chunk_num = 0
         for msg_type, data in SocketProtocol.receive_stream(sock):
             if msg_type == 'audio':
+                chunk_num += 1
                 audio_chunks.append(data)
+
+                # Debug: Show chunk info
+                chunk_samples = len(data) // 4  # 4 bytes per float32
+                chunk_duration = chunk_samples / 24000  # 24kHz sample rate
+                logger.debug(f"Received chunk {chunk_num}: {chunk_samples} samples ({chunk_duration:.2f}s)")
             elif msg_type == 'error':
                 logger.error(f"Server error: {data}")
                 return None
@@ -97,6 +180,7 @@ def send_text(
             return None
 
         # Combine audio chunks
+        logger.info(f"Received {chunk_num} audio chunks total")
         audio_bytes = b''.join(audio_chunks)
         audio = np.frombuffer(audio_bytes, dtype=np.float32)
 

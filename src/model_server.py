@@ -11,7 +11,7 @@ import sys
 import traceback
 from queue import Queue, Empty
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Iterator
 import signal
 
 import torch
@@ -34,6 +34,11 @@ from src.constants import (
     SAMPLE_RATE,
     WARMUP_SAMPLES,
     LOG_DIR,
+    USE_LMDEPLOY,
+    LMDEPLOY_MEMORY_UTIL,
+    LMDEPLOY_TP,
+    LMDEPLOY_ENABLE_PREFIX_CACHING,
+    LMDEPLOY_QUANT_POLICY,
 )
 from src.socket_protocol import SocketProtocol
 from src.utils import build_prompt, extract_snac_codes, unpack_snac_from_7
@@ -51,6 +56,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Try to import LMdeploy if enabled
+LMDEPLOY_AVAILABLE = False
+if USE_LMDEPLOY:
+    try:
+        from lmdeploy import pipeline, TurbomindEngineConfig, GenerationConfig
+        LMDEPLOY_AVAILABLE = True
+        logger.info("LMdeploy is available and will be used")
+    except ImportError:
+        LMDEPLOY_AVAILABLE = False
+        logger.warning("LMdeploy not installed. Install with: pip install lmdeploy")
+        logger.warning("Falling back to transformers backend")
+
 
 class ModelServer:
     """
@@ -60,11 +77,13 @@ class ModelServer:
 
     def __init__(self):
         self.maya_model = None
+        self.lmdeploy_pipe = None
         self.tokenizer = None
         self.snac_model = None
         self.device = None
         self.model_lock = threading.Lock()
         self.running = False
+        self.use_lmdeploy = USE_LMDEPLOY and LMDEPLOY_AVAILABLE
 
         # Request queue and worker threads
         self.request_queue = Queue()
@@ -83,33 +102,58 @@ class ModelServer:
             self.device = "cpu"
             logger.info("Using CPU (this will be slow)")
 
-        # Load Maya1 model
-        logger.info(f"Loading Maya1 model from {MODEL_NAME}...")
-        self.maya_model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        self.maya_model.eval()
-        logger.info(f"Maya1 model loaded successfully")
+        if self.use_lmdeploy:
+            # Load Maya1 with LMdeploy
+            logger.info(f"Loading Maya1 model with LMdeploy from {MODEL_NAME}...")
+            logger.info(f"LMdeploy config: memory_util={LMDEPLOY_MEMORY_UTIL}, tp={LMDEPLOY_TP}, "
+                       f"prefix_caching={LMDEPLOY_ENABLE_PREFIX_CACHING}, quant_policy={LMDEPLOY_QUANT_POLICY}")
 
-        # Load tokenizer
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True
-        )
-        logger.info(f"Tokenizer loaded: {len(self.tokenizer)} tokens in vocabulary")
+            backend_config = TurbomindEngineConfig(
+                cache_max_entry_count=LMDEPLOY_MEMORY_UTIL,  # This is supposed to be memory utilization
+                session_len=4096,  # Maximum session length
+                tp=LMDEPLOY_TP,
+                enable_prefix_caching=LMDEPLOY_ENABLE_PREFIX_CACHING,
+                quant_policy=LMDEPLOY_QUANT_POLICY
+            )
+            self.lmdeploy_pipe = pipeline(MODEL_NAME, backend_config=backend_config)
+            logger.info("Maya1 model loaded successfully with LMdeploy")
 
-        # Load SNAC decoder
+            # Load tokenizer for prompt building
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_NAME,
+                trust_remote_code=True
+            )
+            logger.info(f"Tokenizer loaded: {len(self.tokenizer)} tokens in vocabulary")
+        else:
+            # Load Maya1 with transformers
+            logger.info(f"Loading Maya1 model with transformers from {MODEL_NAME}...")
+            self.maya_model = AutoModelForCausalLM.from_pretrained(
+                MODEL_NAME,
+                dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            self.maya_model.eval()
+            logger.info("Maya1 model loaded successfully with transformers")
+
+            # Load tokenizer
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                MODEL_NAME,
+                trust_remote_code=True
+            )
+            logger.info(f"Tokenizer loaded: {len(self.tokenizer)} tokens in vocabulary")
+
+        # Load SNAC decoder (same for both backends)
         logger.info(f"Loading SNAC decoder from {SNAC_MODEL_NAME}...")
         self.snac_model = SNAC.from_pretrained(SNAC_MODEL_NAME).eval()
         if torch.cuda.is_available():
             self.snac_model = self.snac_model.to("cuda")
         logger.info("SNAC decoder loaded successfully")
 
-        logger.info("All models initialized and ready")
+        backend_name = "LMdeploy" if self.use_lmdeploy else "transformers"
+        logger.info(f"All models initialized and ready (backend: {backend_name})")
 
     def synthesize(
         self,
@@ -157,32 +201,51 @@ class ModelServer:
                 logger.info(f"Full prompt preview: {repr(prompt[:200])}")
                 logger.debug(f"Prompt length: {len(prompt)} chars")
 
-                # Tokenize
-                inputs = self.tokenizer(prompt, return_tensors="pt")
-                logger.debug(f"Input tokens: {inputs['input_ids'].shape[1]}")
-
-                # Move to device
-                if torch.cuda.is_available():
-                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-                # Generate
-                logger.debug("Generating tokens...")
-                with torch.inference_mode():
-                    outputs = self.maya_model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
-                        min_new_tokens=min_new_tokens,
-                        temperature=temperature,
+                if self.use_lmdeploy:
+                    # Generate with LMdeploy
+                    logger.debug("Generating tokens with LMdeploy...")
+                    gen_config = GenerationConfig(
                         top_p=top_p,
+                        top_k=40,
+                        temperature=temperature,
+                        max_new_tokens=max_new_tokens,
                         repetition_penalty=repetition_penalty,
+                        stop_token_ids=[CODE_END_TOKEN_ID],
                         do_sample=True,
-                        eos_token_id=CODE_END_TOKEN_ID,
-                        pad_token_id=self.tokenizer.pad_token_id,
+                        min_p=0.0
                     )
 
-                # Extract generated tokens
-                generated_ids = outputs[0, inputs['input_ids'].shape[1]:].tolist()
-                logger.debug(f"Generated {len(generated_ids)} tokens")
+                    responses = self.lmdeploy_pipe([prompt], gen_config=gen_config, do_preprocess=False)
+                    generated_ids = responses[0].token_ids
+                    logger.debug(f"Generated {len(generated_ids)} tokens")
+                else:
+                    # Generate with transformers
+                    # Tokenize
+                    inputs = self.tokenizer(prompt, return_tensors="pt")
+                    logger.debug(f"Input tokens: {inputs['input_ids'].shape[1]}")
+
+                    # Move to device
+                    if torch.cuda.is_available():
+                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                    # Generate
+                    logger.debug("Generating tokens with transformers...")
+                    with torch.inference_mode():
+                        outputs = self.maya_model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                            do_sample=True,
+                            eos_token_id=CODE_END_TOKEN_ID,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
+
+                    # Extract generated tokens (skip input prompt)
+                    generated_ids = outputs[0, inputs['input_ids'].shape[1]:].tolist()
+                    logger.debug(f"Generated {len(generated_ids)} tokens")
 
                 # Debug: decode the generated text to see what the model produced
                 try:
@@ -231,6 +294,140 @@ class ModelServer:
             logger.error(traceback.format_exc())
             return None
 
+    def synthesize_streaming(
+        self,
+        description: str,
+        text: str,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_p: float = DEFAULT_TOP_P,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        seed: Optional[int] = None,
+        chunk_frames: int = 50,  # Number of SNAC frames per audio chunk
+    ) -> Iterator[np.ndarray]:
+        """
+        Synthesize speech with streaming output.
+        Yields audio chunks as they're generated.
+
+        Args:
+            description: Voice description
+            text: Text to synthesize
+            max_new_tokens: Maximum tokens to generate
+            min_new_tokens: Minimum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            repetition_penalty: Penalty for repetition
+            seed: Random seed for reproducible generation (optional)
+            chunk_frames: Number of SNAC frames to accumulate before yielding audio
+
+        Yields:
+            Audio chunk as numpy array
+        """
+        try:
+            with self.model_lock:
+                # Set random seed if provided
+                if seed is not None:
+                    logger.info(f"Setting seed: {seed}")
+                    torch.manual_seed(seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed)
+                    np.random.seed(seed)
+                else:
+                    logger.info("No seed specified - using random generation")
+
+                # Build prompt
+                prompt = build_prompt(self.tokenizer, description, text)
+                logger.info(f"Synthesizing (streaming): description='{description[:50]}...', text='{text[:50]}...'")
+                logger.debug(f"Chunk size: {chunk_frames} frames")
+
+                # Generate tokens (non-streaming for now - token generation is fast)
+                if self.use_lmdeploy:
+                    logger.debug("Generating tokens with LMdeploy...")
+                    gen_config = GenerationConfig(
+                        top_p=top_p,
+                        top_k=40,
+                        temperature=temperature,
+                        max_new_tokens=max_new_tokens,
+                        repetition_penalty=repetition_penalty,
+                        stop_token_ids=[CODE_END_TOKEN_ID],
+                        do_sample=True,
+                        min_p=0.0
+                    )
+                    responses = self.lmdeploy_pipe([prompt], gen_config=gen_config, do_preprocess=False)
+                    generated_ids = responses[0].token_ids
+                else:
+                    inputs = self.tokenizer(prompt, return_tensors="pt")
+                    if torch.cuda.is_available():
+                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                    logger.debug("Generating tokens with transformers...")
+                    with torch.inference_mode():
+                        outputs = self.maya_model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                            do_sample=True,
+                            eos_token_id=CODE_END_TOKEN_ID,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
+                    generated_ids = outputs[0, inputs['input_ids'].shape[1]:].tolist()
+
+                logger.debug(f"Generated {len(generated_ids)} tokens")
+
+                # Extract SNAC codes
+                snac_tokens = extract_snac_codes(generated_ids)
+                logger.debug(f"Extracted {len(snac_tokens)} SNAC tokens")
+
+                if len(snac_tokens) < 7:
+                    logger.error("Not enough SNAC tokens generated")
+                    return
+
+                # Stream audio in chunks
+                total_frames = len(snac_tokens) // 7
+                logger.info(f"Streaming {total_frames} frames in chunks of {chunk_frames}")
+
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                first_chunk = True
+
+                for start_frame in range(0, total_frames, chunk_frames):
+                    end_frame = min(start_frame + chunk_frames, total_frames)
+
+                    # Extract chunk of SNAC tokens
+                    chunk_tokens = snac_tokens[start_frame * 7:end_frame * 7]
+
+                    # Unpack this chunk
+                    levels = unpack_snac_from_7(chunk_tokens)
+
+                    # Convert to tensors
+                    codes_tensor = [
+                        torch.tensor(level, dtype=torch.long, device=device).unsqueeze(0)
+                        for level in levels
+                    ]
+
+                    # Decode audio chunk
+                    with torch.inference_mode():
+                        z_q = self.snac_model.quantizer.from_codes(codes_tensor)
+                        audio_chunk = self.snac_model.decoder(z_q)[0, 0].cpu().numpy()
+
+                    # Trim warmup samples from first chunk only
+                    if first_chunk and len(audio_chunk) > WARMUP_SAMPLES:
+                        audio_chunk = audio_chunk[WARMUP_SAMPLES:]
+                        first_chunk = False
+
+                    logger.debug(f"Yielding audio chunk: {len(audio_chunk)} samples ({len(audio_chunk)/SAMPLE_RATE:.2f}s)")
+                    yield audio_chunk
+
+                logger.info("Streaming synthesis complete")
+
+        except Exception as e:
+            logger.error(f"Streaming synthesis error: {e}")
+            logger.error(traceback.format_exc())
+            return
+
     def synthesis_worker(self):
         """Worker thread for processing synthesis requests."""
         logger.info(f"Synthesis worker started: {threading.current_thread().name}")
@@ -253,26 +450,47 @@ class ModelServer:
                     top_p = request_data.get('top_p', DEFAULT_TOP_P)
                     repetition_penalty = request_data.get('repetition_penalty', DEFAULT_REPETITION_PENALTY)
                     seed = request_data.get('seed', None)
+                    stream = request_data.get('stream', False)  # Streaming mode flag
 
-                    # Synthesize
-                    audio = self.synthesize(
-                        description=description,
-                        text=text,
-                        max_new_tokens=max_new_tokens,
-                        min_new_tokens=min_new_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                        seed=seed,
-                    )
+                    if stream:
+                        # Streaming mode - send audio chunks as they're generated
+                        chunk_count = 0
+                        for audio_chunk in self.synthesize_streaming(
+                            description=description,
+                            text=text,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                            seed=seed,
+                        ):
+                            audio_bytes = audio_chunk.astype(np.float32).tobytes()
+                            SocketProtocol.send_audio(client_socket, audio_bytes)
+                            chunk_count += 1
 
-                    if audio is not None:
-                        # Send audio data
-                        audio_bytes = audio.astype(np.float32).tobytes()
-                        SocketProtocol.send_audio(client_socket, audio_bytes)
+                        logger.debug(f"Sent {chunk_count} audio chunks")
                         SocketProtocol.send_end(client_socket)
                     else:
-                        SocketProtocol.send_error(client_socket, "Synthesis failed")
+                        # Non-streaming mode - send all audio at once
+                        audio = self.synthesize(
+                            description=description,
+                            text=text,
+                            max_new_tokens=max_new_tokens,
+                            min_new_tokens=min_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            repetition_penalty=repetition_penalty,
+                            seed=seed,
+                        )
+
+                        if audio is not None:
+                            # Send audio data
+                            audio_bytes = audio.astype(np.float32).tobytes()
+                            SocketProtocol.send_audio(client_socket, audio_bytes)
+                            SocketProtocol.send_end(client_socket)
+                        else:
+                            SocketProtocol.send_error(client_socket, "Synthesis failed")
 
                 except Exception as e:
                     logger.error(f"Error processing request: {e}")
